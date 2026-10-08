@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,6 +23,8 @@ func main() {
 		code = cmdDownload(os.Args[2:])
 	case "spotify":
 		code = cmdSpotify(os.Args[2:])
+	case "api":
+		code = cmdAPI(os.Args[2:])
 	case "version":
 		fmt.Println("xcore", version)
 		code = 0
@@ -41,6 +44,10 @@ Usage:
                                      Download audio (m4a/mp3) or video (mp4, --height caps
                                      resolution). Spotify urls auto-route to spotdl (audio only)
   xcore spotify --dir DIR <url>      Download via spotdl
+  xcore api [--addr ADDR] [--dir DIR] Serve the HTTP API for the web app
+                                     (env: XDL_API_ADDR, XDL_API_DIR, XDL_API_KEY,
+                                      XDL_API_CONCURRENCY, XDL_API_MAX,
+                                      XDL_API_TTL_MIN, XDL_API_TIMEOUT_MIN)
   xcore version`)
 }
 
@@ -74,10 +81,10 @@ func cmdDownload(args []string) int {
 		return 2
 	}
 	if isSpotifyURL(url) {
-		return downloadSpotify(url, *dir)
+		return downloadSpotify(context.Background(), url, *dir)
 	}
 	if *ext == "mp4" {
-		path, err := downloadVideo(url, *dir, *height)
+		path, err := downloadVideo(context.Background(), url, *dir, *height, nil)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return 1
@@ -87,7 +94,7 @@ func cmdDownload(args []string) int {
 		}
 		return 0
 	}
-	path, err := downloadAudio(url, *ext, *dir)
+	path, err := downloadAudio(context.Background(), url, *ext, *dir, nil)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -107,5 +114,5 @@ func cmdSpotify(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: xcore spotify --dir DIR <url>")
 		return 2
 	}
-	return downloadSpotify(url, *dir)
+	return downloadSpotify(context.Background(), url, *dir)
 }

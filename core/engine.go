@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,11 +28,15 @@ type TrackInfo struct {
 }
 
 var spotifyRe = regexp.MustCompile(`(?i)open\.spotify\.com|^spotify:`)
+var spotifyTrackRe = regexp.MustCompile(`(?i)(?:open\.spotify\.com/track/|spotify:track:)([a-z0-9]+)`)
 
-// Spotify's WAF rate-limits spotdl's client for a while (HTTP 403 on the
-// session bootstrap). Remember that in a temp file (xcore runs as a fresh
-// process per download) and go straight to the yt-dlp fallback instead of
-// burning 20-30 s on a doomed spotdl run.
+func spotifyTrackID(link string) string {
+	if m := spotifyTrackRe.FindStringSubmatch(link); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
 const spotdlBlockWindow = 10 * time.Minute
 
 func spotdlCooldownFile() string {
@@ -57,9 +62,6 @@ func markSpotdlBlocked() {
 	}
 }
 
-// yt-dlp's default YouTube client (with deno as the JS runtime) is the only
-// one that both lists formats and serves them without a GVS PO token.
-// android_vr used to work for metadata but now returns HTTP 403 on download.
 var youtubeClientArgs = [][]string{
 	{},
 	{"--extractor-args", "youtube:player_client=android"},
@@ -105,101 +107,215 @@ func fetchInfo(url string) (*TrackInfo, error) {
 	}, nil
 }
 
-func downloadAudio(url, ext, dir string) (string, error) {
+type ytMeta struct {
+	extractor string
+	id        string
+	height    string
+}
+
+func prettyExtractor(key string) string {
+	switch key {
+	case "Youtube":
+		return "YouTube"
+	case "Soundcloud":
+		return "SoundCloud"
+	}
+	return key
+}
+
+func serviceFileName(service, kind, id, height, ext string) string {
+	if service == "" {
+		service = "Media"
+	}
+	if id == "" || id == "NA" {
+		id = strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	if kind == "video" {
+		if height != "" && height != "NA" {
+			return fmt.Sprintf("%s_video_%s_%sp.%s", service, id, height, ext)
+		}
+		return fmt.Sprintf("%s_video_%s.%s", service, id, ext)
+	}
+	return fmt.Sprintf("%s_audio_%s.%s", service, id, ext)
+}
+
+func renameService(path, service, kind, id, height string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("no output file")
+	}
+	ext := strings.TrimPrefix(filepath.Ext(path), ".")
+	dst := filepath.Join(filepath.Dir(path), serviceFileName(service, kind, id, height, ext))
+	if dst == path {
+		return path, nil
+	}
+	os.Remove(dst)
+	if err := os.Rename(path, dst); err != nil {
+		return "", fmt.Errorf("rename result: %w", err)
+	}
+	return dst, nil
+}
+
+func downloadAudio(ctx context.Context, url, ext, dir string, onProgress func(float64)) (string, error) {
 	args := []string{
 		"--newline",
+		"--progress",
 		"--no-playlist",
 		"--extract-audio",
 		"--audio-format", ext,
 		"--audio-quality", "0",
 		"--progress-template", "download:[%(progress._percent_str)s] %(progress._speed_str)s",
 		"--print", "after_move:FILE:%(filepath)s",
-		"-o", filepath.Join(dir, "%(title)s.%(ext)s"),
+		"--print", "after_move:META:%(extractor_key)s|%(id)s|%(height)s",
+		"-o", filepath.Join(dir, "%(id)s.%(ext)s"),
 		url,
 	}
-	return runYTDLPYouTube(args, dir)
+	path, meta, err := runYTDLPYouTube(ctx, args, dir, onProgress)
+	if err != nil {
+		return "", err
+	}
+	return renameService(path, prettyExtractor(meta.extractor), "audio", meta.id, meta.height)
 }
 
-func downloadVideo(url, dir string, height int) (string, error) {
+func downloadVideo(ctx context.Context, url, dir string, height int, onProgress func(float64)) (string, error) {
 	format := fmt.Sprintf("bestvideo[height<=%d][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best", height)
 	args := []string{
 		"--newline",
+		"--progress",
 		"--no-playlist",
 		"-f", format,
 		"--merge-output-format", "mp4",
 		"--progress-template", "download:[%(progress._percent_str)s] %(progress._speed_str)s",
 		"--print", "after_move:FILE:%(filepath)s",
-		"-o", filepath.Join(dir, "%(title)s.%(ext)s"),
+		"--print", "after_move:META:%(extractor_key)s|%(id)s|%(height)s",
+		"-o", filepath.Join(dir, "%(id)s.%(ext)s"),
 		url,
 	}
-	return runYTDLPYouTube(args, dir)
+	path, meta, err := runYTDLPYouTube(ctx, args, dir, onProgress)
+	if err != nil {
+		return "", err
+	}
+	return renameService(path, prettyExtractor(meta.extractor), "video", meta.id, meta.height)
 }
 
-// runYTDLPYouTube tries the default client first, then android as a fallback.
-func runYTDLPYouTube(extra []string, dir string) (string, error) {
+func runYTDLPYouTube(ctx context.Context, extra []string, dir string, onProgress func(float64)) (string, ytMeta, error) {
 	var lastErr error
 	for _, client := range youtubeClientArgs {
 		args := append(ytdlpArgs(), client...)
 		args = append(args, extra...)
-		path, err := runYTDLP(args, dir)
+		path, meta, err := runYTDLP(ctx, args, dir, onProgress)
 		if err == nil {
-			return path, nil
+			return path, meta, nil
 		}
 		lastErr = err
 	}
-	return "", lastErr
+	return "", ytMeta{}, lastErr
 }
 
-func runYTDLP(args []string, dir string) (string, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
+type stdoutCapture struct {
+	buf        bytes.Buffer
+	pending    []byte
+	onProgress func(float64)
+}
+
+var progressRe = regexp.MustCompile(`\[ *([0-9]+(?:\.[0-9]+)?)%`)
+
+func (c *stdoutCapture) Write(p []byte) (int, error) {
+	n, err := c.buf.Write(p)
+	if c.onProgress == nil {
+		return n, err
 	}
-	cmd := exec.Command("yt-dlp", args...)
-	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
-	var stdout bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &stdout)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("yt-dlp failed: %w", err)
-	}
-	for _, line := range strings.Split(stdout.String(), "\n") {
-		if strings.HasPrefix(line, "FILE:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "FILE:")), nil
+	c.pending = append(c.pending, p...)
+	for {
+		i := bytes.IndexByte(c.pending, '\n')
+		if i < 0 {
+			break
+		}
+		line := c.pending[:i]
+		c.pending = c.pending[i+1:]
+		if m := progressRe.FindSubmatch(line); m != nil {
+			if v, ferr := strconv.ParseFloat(string(m[1]), 64); ferr == nil {
+				c.onProgress(v)
+			}
 		}
 	}
-	return "", fmt.Errorf("yt-dlp finished but no output file was found")
+	return n, err
 }
 
-func downloadSpotify(url, dir string) int {
+func (c *stdoutCapture) String() string {
+	return c.buf.String()
+}
+
+func runYTDLP(ctx context.Context, args []string, dir string, onProgress func(float64)) (string, ytMeta, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", ytMeta{}, err
+	}
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
+	capture := &stdoutCapture{onProgress: onProgress}
+	cmd.Stdout = io.MultiWriter(os.Stdout, capture)
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", ytMeta{}, fmt.Errorf("yt-dlp failed: %w", err)
+	}
+	var path string
+	var meta ytMeta
+	for _, line := range strings.Split(capture.String(), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "FILE:"):
+			path = strings.TrimPrefix(line, "FILE:")
+		case strings.HasPrefix(line, "META:"):
+			if parts := strings.Split(strings.TrimPrefix(line, "META:"), "|"); len(parts) == 3 {
+				meta = ytMeta{extractor: parts[0], id: parts[1], height: parts[2]}
+			}
+		}
+	}
+	if path == "" {
+		return "", meta, fmt.Errorf("yt-dlp finished but no output file was found")
+	}
+	return path, meta, nil
+}
+
+func downloadSpotify(ctx context.Context, url, dir string) int {
+	path, err := downloadSpotifyFile(ctx, url, dir, nil)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
-
-	// Fast path: track title via Spotify's oEmbed + yt-dlp search (~10 s).
-	path, fastErr := spotifyViaYouTube(url, dir)
-	if path != "" && fastErr == nil {
+	if path != "" {
 		fmt.Println("RESULT:" + path)
-		return 0
+	}
+	return 0
+}
+
+func downloadSpotifyFile(ctx context.Context, url, dir string, onProgress func(float64)) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+
+	path, fastErr := spotifyViaYouTube(ctx, url, dir, onProgress)
+	if path != "" && fastErr == nil {
+		if id := spotifyTrackID(url); id != "" {
+			if renamed, err := renameService(path, "Spotify", "audio", id, ""); err == nil {
+				path = renamed
+			}
+		}
+		return path, nil
 	}
 	if fastErr == nil {
 		fastErr = fmt.Errorf("no output file")
 	}
 
-	// Slow path: spotdl (proper Spotify metadata), used only when the fast
-	// path fails, and gated while Spotify is rate-limiting it.
 	if spotdlBlocked() {
-		fmt.Fprintln(os.Stderr, "error:", fastErr, "(spotdl cooling down, not tried)")
-		return 1
+		return "", fmt.Errorf("%v (spotdl cooling down, not tried)", fastErr)
 	}
 	sub, err := os.MkdirTemp(dir, "spot-")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
+		return "", err
 	}
 	defer os.RemoveAll(sub)
 
-	lastErr := runSpotDLOnce(url, sub)
+	lastErr := runSpotDLOnce(ctx, url, sub)
 	if lastErr == nil {
 		latest, err := newestFile(sub)
 		switch {
@@ -211,22 +327,24 @@ func downloadSpotify(url, dir string) int {
 			final := filepath.Join(dir, filepath.Base(latest))
 			if final != latest {
 				if err := os.Rename(latest, final); err != nil {
-					fmt.Fprintln(os.Stderr, "error:", err)
-					return 1
+					return "", err
 				}
 				latest = final
 			}
-			fmt.Println("RESULT:" + latest)
-			return 0
+			if id := spotifyTrackID(url); id != "" {
+				if renamed, err := renameService(latest, "Spotify", "audio", id, ""); err == nil {
+					latest = renamed
+				}
+			}
+			return latest, nil
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "error: fast path:", fastErr, "; spotdl:", lastErr)
-	return 1
+	return "", fmt.Errorf("fast path: %v; spotdl: %v", fastErr, lastErr)
 }
 
-func runSpotDLOnce(url, sub string) error {
-	cmd := exec.Command("spotdl", "download", url, "--output", sub, "--format", "mp3",
+func runSpotDLOnce(ctx context.Context, url, sub string) error {
+	cmd := exec.CommandContext(ctx, "spotdl", "download", url, "--output", sub, "--format", "mp3",
 		"--bitrate", "320k",
 		"--yt-dlp-args", "--extractor-args youtube:player_client=android --retries 3 --fragment-retries 3")
 	cmd.Env = append(os.Environ(), "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1")
@@ -245,10 +363,7 @@ func runSpotDLOnce(url, sub string) error {
 	return nil
 }
 
-// spotifyViaYouTube resolves the track title via Spotify's oEmbed endpoint
-// (which stays reachable when the main site is rate-limiting) and downloads
-// the first matching YouTube result directly with yt-dlp.
-func spotifyViaYouTube(link, dir string) (string, error) {
+func spotifyViaYouTube(ctx context.Context, link, dir string, onProgress func(float64)) (string, error) {
 	title, err := oembedTitle(link)
 	if err != nil {
 		return "", fmt.Errorf("could not fetch track info from Spotify: %w", err)
@@ -256,16 +371,22 @@ func spotifyViaYouTube(link, dir string) (string, error) {
 	fmt.Println("searching YouTube for:", title)
 	args := []string{
 		"--newline",
+		"--progress",
 		"--no-playlist",
 		"--extract-audio",
 		"--audio-format", "mp3",
 		"--audio-quality", "0",
 		"--progress-template", "download:[%(progress._percent_str)s] %(progress._speed_str)s",
 		"--print", "after_move:FILE:%(filepath)s",
-		"-o", filepath.Join(dir, "%(title)s.%(ext)s"),
+		"--print", "after_move:META:%(extractor_key)s|%(id)s|%(height)s",
+		"-o", filepath.Join(dir, "%(id)s.%(ext)s"),
 		"ytsearch1:" + title,
 	}
-	return runYTDLPYouTube(args, dir)
+	path, meta, err := runYTDLPYouTube(ctx, args, dir, onProgress)
+	if err != nil {
+		return "", err
+	}
+	return renameService(path, prettyExtractor(meta.extractor), "audio", meta.id, meta.height)
 }
 
 func oembedTitle(link string) (string, error) {

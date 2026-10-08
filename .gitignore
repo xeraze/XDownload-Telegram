@@ -10,3 +10,9 @@ botapi/
 bot.err.log
 secrets/
 *.ps1
+*.bat
+.api-key
+.wrangler/
+*~
+
+tools/
