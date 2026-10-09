@@ -14,6 +14,7 @@ START_EN = <<~TEXT.freeze
   Hi! I'm XDownload — paste a link, pick a format, get the file.
 
   Works in chats and groups.
+  Hours: daily 09:00-21:00 Kyiv time (Fri, Sat to 21:30).
   /help — what I support
 TEXT
 
@@ -21,6 +22,7 @@ START_RU = <<~TEXT.freeze
   Привет! Я XDownload — вставьте ссылку, выберите формат, получите файл.
 
   Работаю в чатах и группах.
+  Часы работы: ежедневно 09:00-21:00 по Киеву (пт-сб до 21:30).
   /help — что я поддерживаю
 TEXT
 
@@ -107,8 +109,8 @@ STR = {
     video_btn: "🎬 Video (mp4)",
     lang_pick: "Choose a language:",
     lang_set: "Language: English.",
-    pause_today: "Scheduled shutdown — the bot opens today at 09:00.",
-    pause_tomorrow: "Scheduled shutdown — the bot opens tomorrow at 09:00.",
+    pause_today: "Scheduled shutdown — the bot opens today at 09:00 Kyiv time.",
+    pause_tomorrow: "Scheduled shutdown — the bot opens tomorrow at 09:00 Kyiv time.",
     err_technical: "Technical difficulties on the server — try again later.",
     announce_header: "Developer announcement",
     announce_usage: "Usage: /notice <text>",
@@ -147,8 +149,8 @@ STR = {
     video_btn: "🎬 Видео (mp4)",
     lang_pick: "Выберите язык:",
     lang_set: "Язык: русский.",
-    pause_today: "Плановое выключение — бот откроется сегодня в 09:00.",
-    pause_tomorrow: "Плановое выключение — бот откроется завтра в 09:00.",
+    pause_today: "Плановое выключение — бот откроется сегодня в 09:00 по Киеву.",
+    pause_tomorrow: "Плановое выключение — бот откроется завтра в 09:00 по Киеву.",
     err_technical: "Технические неполадки на сервере — попробуйте позже.",
     announce_header: "Уведомление от разработчика",
     announce_usage: "Использование: /notice <текст>",
